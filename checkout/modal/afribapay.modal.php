@@ -1,10 +1,14 @@
 <?php
-class AfribaPayException extends \Exception {}
-enum AfpEnvironment: string {
+
+if (!defined('MODAL_CUSTOMER_CONFIG_PATH')) {
+    define("MODAL_CUSTOMER_CONFIG_PATH", dirname(__FILE__, 2) . '/customer_config.inc.php');
+}
+class AfribaPayModalException extends \Exception {}
+enum AfpModalEnvironment: string {
     case Sandbox = 'sandbox';
     case Production = 'production';
 }
-class AfpConfiguration {
+class AfpModalConfiguration {
     private string $environment;
     private array $urls;
     private $params;
@@ -12,32 +16,34 @@ class AfpConfiguration {
     public function __construct() {
         $this->validateConfigInc();
         $this->environment = $this->getConfigInc('environment');
-        if(!AfpEnvironment::tryFrom($this->environment)){
+        if(!AfpModalEnvironment::tryFrom($this->environment)){
             throw new InvalidArgumentException("Invalid environment: $this->environment");
         }
         $checkoutPath = $this->getConfigInc('checkoutPath');
         $this->urls = [
             'production' => [
-                'baseURL' => 'https://api.afribapay.com',
-                'checkout' => $checkoutPath.'checkout.php',
+                'baseURL' => modal_afp_resolve_base_url('production'),
+                'checkout' => $checkoutPath,
             ],
             'sandbox' => [
-                'baseURL' => 'https://api-sandbox.afribapay.com',
-                'checkout' => $checkoutPath.'checkout.php',
+                'baseURL' => modal_afp_resolve_base_url('sandbox'),
+                'checkout' => $checkoutPath,
             ]
+
         ];
     }
 
     private function validateConfigInc() {
-        $customer_config_path = dirname(__FILE__, 2).'/customer_config.inc.php';
-        if (file_exists($customer_config_path)) {
-            $params = require_once($customer_config_path);
-        } else {
-            throw new AfribaPayException("The customer_config.inc.php file was not found at the specified location : " . $customer_config_path);
-        }   
+
+        if (!file_exists(MODAL_CUSTOMER_CONFIG_PATH)) {
+            throw new AfribaPayException("The customer_config.inc.php file was not found at: " . MODAL_CUSTOMER_CONFIG_PATH); 
+        }
+
+        $params = require MODAL_CUSTOMER_CONFIG_PATH;
         if (!is_array($params)) {
             throw new AfribaPayException("Invalid customer_config.inc.php file");
         }
+
         $this->params = $params;
         $requiredFields = [
             'apiUser', 
@@ -52,11 +58,8 @@ class AfpConfiguration {
         ];
         foreach ($requiredFields as $field) {
             if (!isset($this->params[$field]) || ($field !== 'useCacheFolder' && empty($this->params[$field]))) {
-                throw new AfribaPayException("Missing required field in AfribapayConfig.inc.php file: $field");
+                throw new AfribaPayException("Missing required field in config.inc.php file: $field");
             }
-        }
-        if (substr($this->params['checkoutPath'], -1) !== '/') {
-            throw new AfribaPayException("Field 'checkoutPath' in AfribapayConfig.inc.php must end with a '/'.");
         }
         $useCacheValue = $this->params['useCacheFolder'];
         if (!is_bool($useCacheValue) && 
@@ -66,7 +69,7 @@ class AfpConfiguration {
             $useCacheValue !== 0 &&
             $useCacheValue !== '1' && 
             $useCacheValue !== '0') {
-            throw new AfribaPayException("Field 'useCacheFolder' in AfribapayConfig.inc.php must be true or false");
+            throw new AfribaPayException("Field 'useCacheFolder' in config.inc.php must be true or false");
         }
         if ($useCacheValue === 'true' || $useCacheValue === '1' || $useCacheValue === 1) {
             $this->params['useCacheFolder'] = true;
@@ -74,8 +77,9 @@ class AfpConfiguration {
             $this->params['useCacheFolder'] = false;
         }
         if (!in_array($params['lang'], ['en', 'fr'])) {
-            throw new AfribaPayException("Field 'lang' in AfribapayConfig.inc.php must be 'fr' or 'en' ");
+            throw new AfribaPayException("Field 'lang' in config.inc.php must be 'fr' or 'en' ");
         }
+
     }
 
     public function getConfigInc($key){
@@ -91,18 +95,29 @@ class AfpConfiguration {
         return $this->urls[$this->environment]['baseURL'] 
         ?? throw new AfribaPayException("Invalid environment");
     }
+
 }
-class AfribaPayRequest {
-    private $requiredFields = [];
+class AfribaPayModalRequest {
+    private $requiredFields = [
+        // TODO: add for seamless
+        // 'description',
+    ];
     private $allowedFields = [
         'amount', 
         'currency', 
         'order_id', 
         'reference_id', 
         'country', 
-        'lang', 
         'showCountries', 
-        'notify_url'
+        'notify_url',
+
+        // TODO: add for seamless
+        // 'description',
+        // 'company',
+        // 'checkout_name',
+        // 'logo_url',
+        // 'return_url',
+        // 'cancel_url',
     ];
     private $data = [];
 
@@ -123,6 +138,9 @@ class AfribaPayRequest {
         if($name == 'amount' && $value < 1){
             throw new AfribaPayException("$name cannot be less than 1");
         }
+        if (in_array($name, self::URL_FIELDS, true) && !$this->isHttpUrl($value)) {
+            throw new AfribaPayException("$name must be a valid http(s) URL");
+        }
         $this->data[$name] = $this->sanitizeInput($value);
     }
 
@@ -130,9 +148,18 @@ class AfribaPayRequest {
         return $this->data[$name] ?? null;
     }
 
+    private const URL_FIELDS = ['notify_url', 'return_url', 'cancel_url', 'logo_url'];
 
+    private function isHttpUrl($url): bool {
+        if (!is_string($url) || !filter_var(trim($url), FILTER_VALIDATE_URL)) {
+            return false;
+        }
+        return in_array(strtolower((string)parse_url(trim($url), PHP_URL_SCHEME)), ['http', 'https'], true);
+    }
+
+    // Stored raw (HTML escaping here broke URLs); escaped when displayed
     private function sanitizeInput($value) {
-        return htmlspecialchars(strip_tags(trim($value)), ENT_QUOTES, 'UTF-8');
+        return is_string($value) ? strip_tags(trim($value)) : $value;
     }
     
     public function validate() {
@@ -148,89 +175,52 @@ class AfribaPayRequest {
     }
 }
 class AfribaPayModal {
-    private AfpConfiguration $config;
+    private AfpModalConfiguration $config;
     private string $lang;
+    private static bool $bootstrapLoaded = false;
+    private static bool $formScriptLoaded = false;
 
     public function __construct() {
-        $this->config = new AfpConfiguration();
+        $this->config = new AfpModalConfiguration();
         $this->lang =  $this->config->getConfigInc('lang');
+        print $this->getBootstrapLink();
     }
 
     public function createCheckoutButton(
-        AfribaPayRequest $request,
+        AfribaPayModalRequest $request,
         string $buttonText = 'Pay',
         string $buttonColor = '#4CAF50',
         string $size = 'medium',
         array $additionnalClass = []
     ): string {
         $request->validate();
-        return $this->generateCheckoutForm($request, $buttonText, $buttonColor, $size, $additionnalClass);
-    }
-
-    private function generateCheckoutForm(
-        AfribaPayRequest $request,
-        string $buttonText,
-        string $buttonColor,
-        string $size,
-        array $additionnalClass
-    ): string {
-        $formId = $this->generateFormId($buttonText);
-        $html = $this->getButtonStyles();
-        $formData = array_merge(
-            $request->toArray(),
-            [
-                'baseUrl' => $this->config->getBaseUrl(),
-                'AfpModalPost' => time(),
-                'showCountries' => $request->showCountries ?? true
-            ]
-        );
+        $formId = 'afp-form-'.uniqid();
+        $html = '';
         $html .= $this->createSubmitButton($formId, $buttonText, $buttonColor, $size, $additionnalClass);
-        $html  .= (new AfpModal())->generateModal($formId, $formData, $this->config->getCheckoutUrl(), $this->lang);
+        $html  .= (new AfpModal())->generateModal($formId, $this->prepareHiddenInputs($request->toArray()), $this->config->getCheckoutUrl(), $this->lang);
         return $html;
     }
 
-    private function generateFormId(string $buttonText): string {
-        return strtoupper(str_replace(' ', '_', trim($buttonText))) . '__' . random_int(0, 9999);
+    private function prepareHiddenInputs(array $data): array {
+        $merchantKey = $this->config->getConfigInc('merchantKey');
+        $payload = array_merge(
+            $data,
+            [
+                'baseUrl' => $this->config->getBaseUrl(),
+                'seamlessModalId' => 'seamless_modal_' . bin2hex(random_bytes(16)),
+                'showCountries' => $data['showCountries'] ?? true,
+            ]
+        );
+        $payload['afp_signature'] = modal_afp_sign_payload($payload, $this->config->getConfigInc('apiKey'), $merchantKey);
+        return $payload;
     }
 
-    private function getButtonStyles(): string {
-        return '
-        <style>
-            .afp-custom-pay-button {
-                background-color: #4CAF50;
-                color: white;
-                border: none;
-                padding: 12px 24px;
-                font-size: 16px;
-                cursor: pointer;
-                border-radius: 8px;
-                transition: background-color 0.3s, transform 0.2s, box-shadow 0.2s;
-                box-shadow: 0px 4px 6px rgba(0, 0, 0, 0.1);
-                font-weight: bold;
-            }
-            .afp-custom-pay-button:hover {
-                background-color: #45a049;
-                transform: translateY(-2px);
-                box-shadow: 0px 6px 8px rgba(0, 0, 0, 0.15);
-            }
-            .afp-custom-pay-button:active {
-                background-color: #3e8e41;
-                transform: translateY(1px);
-                box-shadow: 0px 2px 4px rgba(0, 0, 0, 0.1);
-            }
-            .afp-custom-pay-button.small {
-                padding: 5px 10px;
-                font-size: 12px;
-            }
-            .afp-custom-pay-button.medium {
-                padding: 10px 20px;
-                font-size: 16px;
-            }
-            .afp-custom-pay-button.large {
-                padding: 15px 30px;
-                font-size: 20px;
-            }
-        </style>';
+    private function getFormScript(): string {
+        if (self::$formScriptLoaded) { return '';}
+        self::$formScriptLoaded = true;
+        $checkoutUrl = htmlspecialchars($this->config->getCheckoutUrl(), ENT_QUOTES, 'UTF-8');
+        $script = '(function(){function a(){var b=document.querySelectorAll("form.afp-payment-form");b.forEach(function(c){if(c.hasAttribute("data-afp-initialized"))return;c.setAttribute("data-afp-initialized","true");var d=c.querySelector("button[type=\'submit\']");if(!d)return;d.addEventListener("click",function(e){e.preventDefault();var f=c.getAttribute("data-afp-data");if(!f){console.error("AfribaPay: Missing data");return}var g=c.querySelector("input[name=\'afp_data\']");if(g)g.remove();var h=document.createElement("input");h.type="hidden";h.name="afp_data";h.value=f;c.appendChild(h);c.action="' . $checkoutUrl . '";c.method="post";c.submit()})})}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",a)}else{a()}})();';
+        return '<script>' . $script . '</script>';
     }
 
     private function createSubmitButton(
@@ -240,26 +230,94 @@ class AfribaPayModal {
         string $size,
         array $additionnalClass
     ): string {
-        $sizeClass = $this->getButtonSizeClass($size);
+        $sizeClass = $this->getSizeClass($size);
+        $colorClass = $this->getColorClass($buttonColor);
         $extraClasses = implode(' ', array_map('htmlspecialchars', $additionnalClass));
-        $allClasses = trim("afp-custom-pay-button $sizeClass $extraClasses");
-        $modalId = $formId;
+        $allClasses = trim("btn {$colorClass} {$sizeClass} afp-payment-btn {$extraClasses}");
+        $inlineStyle = $this->isCustomColor($buttonColor) 
+            ? sprintf('style="background-color: %s !important; border-color: %s !important; color: white;"', 
+                htmlspecialchars($buttonColor, ENT_QUOTES, 'UTF-8'),
+                htmlspecialchars($buttonColor, ENT_QUOTES, 'UTF-8')
+              )
+            : '';
+        $safeModal= sprintf("data-bs-toggle=\"modal\" data-bs-target=\"#%s\"", htmlspecialchars($formId, ENT_QUOTES, 'UTF-8'));
         return sprintf(
-            "<button type=\"button\" style=\"background-color: %s;\" class=\"%s\" data-bs-toggle=\"modal\" data-bs-target=\"#{$modalId}\">%s</button>",
-            htmlspecialchars($buttonColor, ENT_QUOTES, 'UTF-8'),
+            '<button type="submit" class="%s" %s %s >%s</button>',
             $allClasses,
+            $inlineStyle,
+            $safeModal,
             htmlspecialchars($buttonText, ENT_QUOTES, 'UTF-8')
-        ); 
+        );
     }
 
-    private function getButtonSizeClass(string $size): string {
+    private const BOOTSTRAP_CDN_URLS = [
+        'https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/css/bootstrap.min.css',
+        'https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.8/css/bootstrap.min.css',
+        'https://unpkg.com/bootstrap@5.3.8/dist/css/bootstrap.min.css',
+    ];
+
+    private function getBootstrapLink(): string {
+        if (self::$bootstrapLoaded) {
+            return '';
+        }
+        self::$bootstrapLoaded = true;
+
+        $option = $this->config->getConfigInc('bootstrapCss') ?? 'auto';
+        if ($option === false || $option === 'false' || $option === '') {
+            return '';
+        }
+
+        if ($option !== 'auto' && is_string($option)) {
+            return sprintf(
+                '<link id="afp-bootstrap-css" rel="stylesheet" href="%s">',
+                htmlspecialchars($option, ENT_QUOTES, 'UTF-8')
+            );
+        }
+
+        $urls      = self::BOOTSTRAP_CDN_URLS;
+        $first     = array_shift($urls);
+        $fallbacks = implode('|', $urls);
+
+        // On load error, the browser switches to the next CDN
+        $onError = "var f=(this.dataset.fallbacks||'').split('|').filter(Boolean);"
+                 . "if(f.length){this.dataset.fallbacks=f.slice(1).join('|');this.href=f[0];}";
+
+        return sprintf(
+            '<link id="afp-bootstrap-css" rel="stylesheet" href="%s" data-fallbacks="%s" onerror="%s">',
+            htmlspecialchars($first, ENT_QUOTES, 'UTF-8'),
+            htmlspecialchars($fallbacks, ENT_QUOTES, 'UTF-8'),
+            htmlspecialchars($onError, ENT_QUOTES, 'UTF-8')
+        );
+    }
+
+    private function getSizeClass(string $size): string {
         return match (strtolower($size)) {
-            'small' => 'small',
-            'large' => 'large',
-            default => 'medium',
+            'small', 'sm' => 'btn-sm',
+            'large', 'lg' => 'btn-lg',
+            'medium', 'md', '' => 'btn-md',
+            default => 'btn-md',
         };
     }
+
+    private function getColorClass(string $color): string {
+        $colorMap = [
+            'success' => 'btn-success',
+            'primary' => 'btn-primary',
+            'secondary' => 'btn-secondary',
+            'danger' => 'btn-danger',
+            'warning' => 'btn-warning',
+            'info' => 'btn-info',
+            'dark' => 'btn-dark',
+            'light' => 'btn-light',
+        ];
+        return $colorMap[$color] ?? $color;
+    }
+
+    private function isCustomColor(string $color): bool {
+        return !in_array(strtolower($color), ['success', 'primary', 'secondary', 'danger', 'warning', 'info', 'dark', 'light']);
+    }
 }
+
 class AfpModal {
     private function getButtonTexts(string $lang): array {
         $translations = [
@@ -277,14 +335,14 @@ class AfpModal {
         return $translations[$lang] ?? $translations['fr'];
     }     
 
-    public function generateModal(string $modalId, array $postData = [], $contentUrl = null, $lang = 'fr'): string {
+    public function generateModal(string $modalId, array $postData = [], $contentUrl = null, $lang = 'en'): string {
         if (empty($contentUrl)) { throw new AfribaPayException("Content URL is required"); }
         $protocol = $this->is_https() ? "https" : "http";
-        $contentUrl = $protocol."://".$_SERVER['HTTP_HOST'].$contentUrl;
+        $contentUrl = $protocol."://".$_SERVER['HTTP_HOST'].$contentUrl."checkout.php";
         $contentUrl = filter_var($contentUrl, FILTER_VALIDATE_URL);
         if ($contentUrl === false) { throw new AfribaPayException("Invalid content URL"); }
         $safeModalId = preg_replace('/[^a-zA-Z0-9_]/', '_', $modalId);
-        $postDataJson = json_encode($postData);
+        $postDataJson = json_encode($postData, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT);
         $buttonTexts = $this->getButtonTexts($lang);
         return "
             <div class=\"modal fade\" id=\"{$modalId}\" tabindex=\"-1\" aria-labelledby=\"{$modalId}Label\" aria-hidden=\"true\">
@@ -303,10 +361,8 @@ class AfpModal {
                     </div>
                 </div>
             </div>
-            <link href=\"https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha3/dist/css/bootstrap.min.css\" rel=\"stylesheet\">
-            <script src=\"https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha3/dist/js/bootstrap.bundle.min.js\"></script>
-            <script src=\"https://code.jquery.com/jquery-3.6.4.min.js\"></script>
-            <script src=\"https://cdnjs.cloudflare.com/ajax/libs/select2/4.1.0-rc.0/js/select2.min.js\"></script>
+            <script>if(!document.querySelector('script[src*=\"bootstrap.bundle\"]')){var s=document.createElement('script');s.src='https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/js/bootstrap.bundle.min.js';document.head.appendChild(s);}</script>
+            <script>if(typeof jQuery==='undefined'){var s=document.createElement('script');s.src='https://code.jquery.com/jquery-3.7.1.min.js';document.head.appendChild(s);}</script>
             <script>
                 if (!window.{$safeModalId}_data) {
                     window.{$safeModalId}_data = {};
@@ -336,6 +392,7 @@ class AfpModal {
                         if (focusedElement) {focusedElement.blur();}
                     });
                     function loadContent() {
+                        isLoaded = true;
                         footerDiv.style.display = 'none';
                         contentDiv.innerHTML = '<div class=\"text-center\"><div class=\"spinner-border\" role=\"status\"><span class=\"visually-hidden\">{$buttonTexts['loading']}</span></div><p class=\"mt-2\">{$buttonTexts['loading']}</p></div>';
                         fetch('{$contentUrl}', {
@@ -375,6 +432,7 @@ class AfpModal {
                             setupStatusObserver();
                         })
                         .catch(error => {
+                            isLoaded = false;
                             contentDiv.innerHTML = '<div class=\"alert alert-danger\"> {$buttonTexts['loadingError']} ' + error.message + '</div>';
                             footerDiv.style.display = 'flex';
                         });
@@ -418,18 +476,32 @@ class AfpModal {
                         });
                         const config = { attributes: true, childList: true, subtree: true };
                         observer.observe(contentDiv, config);
-                        window.{$safeModalId}_data.statusInterval = setInterval(function() {
-                            const currentContent = contentDiv.innerHTML;
-                            if (window.{$safeModalId}_data.lastPolledContent !== currentContent) {
-                                window.{$safeModalId}_data.lastPolledContent = currentContent;
-                                handleTransactionStatus(currentContent);
-                            }
-                        }, 1000);
-                        modal.addEventListener('hidden.bs.modal', function() {
-                            if (window.{$safeModalId}_data.statusInterval) {
-                                clearInterval(window.{$safeModalId}_data.statusInterval);
+                        let pollCount = 0;
+                        let pollDelay = 2000;
+                        let maxPolls = 30;
+
+                        function schedulePoll() {
+                            window.{$safeModalId}_data.statusTimeout = setTimeout(function() {
+                                if (pollCount >= maxPolls) { return; }
+
+                                const currentContent = contentDiv.innerHTML;
+                                if (window.{$safeModalId}_data.lastPolledContent !== currentContent) {
+                                    window.{$safeModalId}_data.lastPolledContent = currentContent;
+                                    handleTransactionStatus(currentContent);
+                                }
+
+                                pollCount++;
+                                pollDelay = Math.min(pollDelay * 1.1, 10000);
+                                schedulePoll();
+                            }, pollDelay);
+                        }
+                        schedulePoll();
+                        modal.addEventListener('hidden.bs.modal', function cleanupModal() {
+                            if (window.{$safeModalId}_data.statusTimeout) {
+                                clearTimeout(window.{$safeModalId}_data.statusTimeout);
                             }
                             observer.disconnect();
+                            modal.removeEventListener('hidden.bs.modal', cleanupModal);
                         });
                     }
                     function processUrls(container) {

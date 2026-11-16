@@ -1,54 +1,48 @@
 <?php
 
+// Include the automatic detection function
+require_once __DIR__ . '/Helpers/Helpers.php';
+
 return [
-    // 🔐 Public identifier for the API client.
-    // Used to identify the client application making requests (non-sensitive).
-    'apiUser' => 'pk_sandbox_6c47d814-8647-4201-a650-a2afff6247ae',
+    // The user identifier for the API, typically a public key.
+    'apiUser' => 'pk_sandbox_261012052931cqRn9OC',
 
-    // 🔒 Secret key for authenticating API requests.
-    // Keep this key secure—never expose it on the frontend or in public repositories.
-    'apiKey' => 'sk_sandbox_NRwBOQDCunv3C1W4PK9kfH04TI6738Q3gBx',
+    // The secret key for authenticating API requests, keep this secure.
+    'apiKey' => 'sk_sandbox_AFP121026ZGBtRpjREmKs1ansIQIw',
 
-    // 🧾 Unique merchant identifier.
-    // Associates API requests with a specific merchant account in the system.
-    'merchantKey' => 'mk_sandbox_8ORoB612502220',
+    // The merchant key, specific to the account of the merchant using the API.
+    'merchantKey' => 'mk_sandbox_2610120529319E',
 
-    // 🤝 Agent or partner identifier.
-    // Used to track transactions, reporting, and agent-level access control.
+    // The unique identifier for the agent, used to track transactions or activities.
     'agent_id' => 'APM31923613',
 
-    // 🌍 Current API environment: 'production' for live usage, 'sandbox' for testing and development.
-    // Ensure correct mode to avoid sending test data to the live system.
+    // Specifies the environment where the API is running: 'production' for live usage, or 'sandbox' for testing.
     'environment' => 'sandbox',
 
-    // 🗣 Language preference for API responses and interface content.
-    // Supported values typically include 'en' (English), 'fr' (French), etc.
+    // Sets the language for API responses, here 'fr' for French.
     'lang' => 'en',
 
-    // 📬 Notification URL (IPN endpoint).
-    // The API will send transaction status updates via POST to this URL.
-    // Must be a secure and publicly accessible endpoint on your server.
-    'notify_url' => "https://www.example2.com/webhook/notify", // Replace with your actual webhook URL
+    // URL that the payment system will notify (via POST) about the result/status of the transaction.
+    // This endpoint should handle IPN (Instant Payment Notification) securely.
+    // 'notify_url' => "https://www.examplee.com/checkout/notify", // Replace this with your own URL
+    
+    // Automatically detect the relative path to the checkout folder
+    // This function calculates the correct path based on the environment 
+    'checkoutPath' => modal_afp_autoDetectCheckoutPath(),
+    // 'checkoutPath' => '/ck/modal',
 
-    // 🧩 Relative filesystem path to the embedded checkout SDK modal.
-    // This should point to the directory containing the seamless modal integration files,
-    // including `checkout.php`, stylesheets, and scripts needed to launch the payment interface.
-    //
-    // ✅ This path is relative to your web application's document root (e.g., /var/www/html).
-    // ✅ Ensure the folder and its contents are accessible by your application during runtime.
-    // ❗ Do NOT expose sensitive logic within this directory—this should be frontend-only assets.
-    //
-    // Example:
-    // If your application is hosted at https://yourdomain.com/ and the checkout modal lives in
-    // /var/www/html/afribapay-php-checkout-seamless-modal/checkout/,
-    // then set: 'checkoutPath' => '/afribapay-php-checkout-seamless-modal/checkout/',
-    'checkoutPath' => '/afribapay-sdk/afribapay-php-checkout-seamless-modal/checkout/', // ✅ Update as per your deployment path
-
-    // 🧠 Enable server-side caching of transaction/session data.
-    // Recommended for production use; disables fallback to client-side cookies.
+    // Indicates whether to use a cache folder to store session/transaction data (recommended for server environments).
+    // If false, fallback to client-side cookies.
     'useCacheFolder' => true,
 
-    // 📁 Directory for storing cached data (used only if 'useCacheFolder' is true).
-    // Defaults to the system temp directory, but can be customized.
+    // Directory path to store cached data if 'useCacheFolder' is true.
+    // `sys_get_temp_dir()` returns the system's temporary directory dynamically.
     'cacheDirectory' => sys_get_temp_dir(),
+
+    // Bootstrap CSS used by the modal:
+    //  - 'auto'  : load from public CDNs with automatic browser-side fallback (default)
+    //  - string  : your own URL (self-hosted file or another CDN)
+    //  - false   : do not inject anything (your site already loads Bootstrap 5)
+    'bootstrapCss' => 'auto',
+
 ];

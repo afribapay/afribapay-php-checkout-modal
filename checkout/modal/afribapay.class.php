@@ -1,15 +1,7 @@
 <?php
-/**
- * AfribapayClass.php
- * 
- * This class handles the integration with the Afribapay payment gateway.
- * It provides methods to fetch countries, initiate payments, and check payment status.
- * 
- */
-require_once 'AfribapayConfig.inc.php';
 
 define('CACHE_PATH_FILE', TransactionConfig::getCacheDirectory(). '/afribapay-countries.json');
-define('COUNTRIES_CACHE_DURATION', 3600 * 72);  // 3 JOURS
+define('COUNTRIES_CACHE_DURATION', 3600 * 72);
 
 class AfribapayClass {
     private static $config = [];
@@ -17,13 +9,12 @@ class AfribapayClass {
     private $tokenExpiration;
 
     public $formParameters = [];
-    public $formLangData = [];
 
     public function __construct() {
         self::$config = TransactionConfig::getConfigurations();
         $this->formParameters = TransactionConfig::getParameters();
-        $lang = !empty($this->formParameters['lang']) ? $this->formParameters['lang'] : 'fr';
-        $this->formLangData = $this->language($lang);
+        modal_afp_load_language($this->formParameters['lang'] ?? 'en');
+
         $this->token = null;
         $this->tokenExpiration = 0;
     }
@@ -47,6 +38,7 @@ class AfribapayClass {
                             $row = [];
                             $row['country_code'] = $country['country_code'];
                             $row['country_name'] = $country['country_name'];
+                            $row['country_flag'] = $country['country_flag'];
                             $row['prefix']       = $country['prefix'];
                             $row['taxes']        = $country['taxes'];
                             $row['currencies'][$current] = $country['currencies'][$current];
@@ -62,7 +54,7 @@ class AfribapayClass {
             return $countriesToShow;
         } catch (Exception $error) {
             $this->afpDebug("Error fetching countries: " . $error->getMessage());
-            return ['error' => 'Failed to fetch countries', 'message' => $error->getMessage()];
+            return ['error' => 'Failed to fetch countries', 'message' => modal_afp_public_error($error)];
         }
     }
 
@@ -72,7 +64,7 @@ class AfribapayClass {
             echo json_encode($getCheckout);
         } catch (Exception $error) {
             $this->afpDebug("Error during payment initialization: " . $error->getMessage());
-            echo json_encode(['error' => 'An error occurred during payment initialization.', 'message' => $error->getMessage()]);
+            echo json_encode(['error' => 'An error occurred during payment initialization.', 'message' => modal_afp_public_error($error)]);
         }
     }
 
@@ -82,40 +74,28 @@ class AfribapayClass {
             echo json_encode($sendWalletOtp);
         } catch (Exception $error) {
             $this->afpDebug("Error during payment initialization: " . $error->getMessage());
-            echo json_encode(['error' => 'An error occurred during payment initialization.', 'message' => $error->getMessage()]);
+            echo json_encode(['error' => 'An error occurred during payment initialization.', 'message' => modal_afp_public_error($error)]);
         }
     }
 
-    public function getStatus($order_id) {
+    // $paymentId: the transaction_id of the payment (an order_id is still accepted)
+    public function getStatus($paymentId) {
         try {
-            $getStatus = $this->status($order_id);
+            if (is_string($paymentId) && TransactionConfig::isKnownPaymentTransactionId($paymentId)) {
+                $lookup = 'transaction_id';
+            } elseif (is_string($paymentId) && TransactionConfig::isKnownOrderId($paymentId)) {
+                $lookup = 'order_id';
+            } else {
+                http_response_code(403);
+                echo json_encode(['error' => 'Unknown payment for this session.']);
+                return;
+            }
+            $getStatus = $this->status($paymentId, $lookup);
             echo json_encode($getStatus);
         } catch (Exception $error) {
             $this->afpDebug("Error during payment initialization: " . $error->getMessage());
-            echo json_encode(['error' => 'An error occurred during payment initialization.', 'message' => $error->getMessage()]);
+            echo json_encode(['error' => 'An error occurred during payment initialization.', 'message' => modal_afp_public_error($error)]);
         }
-    }
-
-    private function language($langx = 'fr') {
-        $configFilePath = dirname(__FILE__, 2 )."/src/lang/{$langx}.json";
-        if (!file_exists($configFilePath)) {
-            throw new Exception('Language file not found for ' . $configFilePath);
-        }
-        $configData = file_get_contents($configFilePath);
-        if ($configData === false) {
-            throw new Exception('Error loading config.json file');
-        }
-        return json_decode($configData, true);
-    }
-
-    public function usualCurrency($currency) {
-        $symbols = [
-            'XOF' => 'FCFA',
-            'XAF' => 'FCFA',
-            'USD' => '$',
-            'EUR' => '€',
-        ];
-        return $symbols[$currency] ?? $currency;
     }
 
     private function getCache() {
@@ -130,26 +110,37 @@ class AfribapayClass {
         file_put_contents(CACHE_PATH_FILE, json_encode($cache, JSON_PRETTY_PRINT));
     }
 
+    private function apiUrl(string $path): string {
+        return rtrim(self::$config['baseUrl'], '/') . '/' . ltrim($path, '/');
+    }
+
     private function createCurlHandle($url, $isPost = false, $headers = []) {
         $ch = curl_init();
         curl_setopt_array($ch, [
             CURLOPT_URL => $url,
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_POST => $isPost,
-            CURLOPT_HTTPHEADER => $headers
+            CURLOPT_HTTPHEADER => $headers,
+            CURLOPT_CONNECTTIMEOUT => 10,
+            CURLOPT_TIMEOUT => 30,
         ]);
         return $ch;
     }
 
     private function executeRequest($ch) {
-        try{
-            $response = curl_exec($ch);
-            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-            curl_close($ch);
-            return ['httpCode' => $httpCode, 'response' => json_decode($response, true)];
-        }catch(Exception $e){
-            throw new Exception($e->getMessage());
+        $response = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $curlErrno = curl_errno($ch);
+        $curlError = curl_error($ch);
+        $url = curl_getinfo($ch, CURLINFO_EFFECTIVE_URL);
+        curl_close($ch);
+
+        if ($curlErrno !== 0 || $response === false) {
+            $host = parse_url((string)$url, PHP_URL_HOST) ?: (string)$url;
+            throw new Exception("Network error while contacting {$host}: {$curlError} (cURL error {$curlErrno}).");
         }
+
+        return ['httpCode' => $httpCode, 'response' => json_decode($response, true)];
     }
 
     private function checkConfigParam(): void {
@@ -174,7 +165,9 @@ class AfribapayClass {
             if (!empty($emptyKeys)) {
                 $errorMessages[] = "Empty or null key(s) : " . implode(', ', $emptyKeys);
             }
-            throw new InvalidArgumentException(implode(' | ', $errorMessages) . ' in configuration data.');
+            if(!empty($errorMessages)){
+                throw new InvalidArgumentException(implode(' | ', $errorMessages) . ' in configuration data.');
+            }
         }
         if (!$this->isUrlStrictlyValid(self::$config['baseUrl'])) {
             throw new Exception("Invalid baseUrl format.");
@@ -206,7 +199,7 @@ class AfribapayClass {
             }
             $credentials = base64_encode(self::$config['apiUser'] . ':' . self::$config['apiKey']);
             $ch = $this->createCurlHandle(
-                self::$config['baseUrl'] . '/v1/token',
+                $this->apiUrl('/v1/token'),
                 true,
                 [
                     'Authorization: Basic ' . $credentials,
@@ -220,7 +213,13 @@ class AfribapayClass {
                 $this->tokenExpiration = time() + $expires_in;
                 return $this->token;
             }
-            throw new Exception("Invalid authentication credentials.");
+            $apiMessage = $result['response']['message'] ?? $result['response']['error'] ?? null;
+            if (in_array($result['httpCode'], [401, 403], true)) {
+                throw new Exception("Invalid authentication credentials (HTTP {$result['httpCode']}). Check apiUser, apiKey and environment in customer_config.inc.php."
+                    . ($apiMessage ? " API message: " . (is_string($apiMessage) ? $apiMessage : json_encode($apiMessage)) : ''));
+            }
+            throw new Exception("Authentication failed: unexpected API response (HTTP {$result['httpCode']})."
+                . ($apiMessage ? " API message: " . (is_string($apiMessage) ? $apiMessage : json_encode($apiMessage)) : ''));
         }catch(Exception $e){
             throw new Exception($e->getMessage());
         }
@@ -274,7 +273,7 @@ class AfribapayClass {
             }
 
             $ch = $this->createCurlHandle(
-                self::$config['baseUrl'] . '/v1/countries',
+                $this->apiUrl('/v1/countries'),
                 false,
                 [
                     'Authorization: Bearer ' . $token,
@@ -290,23 +289,61 @@ class AfribapayClass {
         }
     }
 
+    // Merchant values always win; the browser may only fill them when left empty (free amount)
+    private function lockedPaymentValues(array $data): array {
+        if (!TransactionConfig::hasTransaction()) {
+            throw new Exception("Payment session expired or invalid. Please reload the page and try again.");
+        }
+        $values = [];
+
+        $merchantAmount = $this->formParameters['amount'] ?? null;
+        $browserAmount  = isset($data['amount']) && is_numeric($data['amount']) ? floor($data['amount']) : null;
+        if (!empty($merchantAmount)) {
+            if ($browserAmount !== null && (int)$browserAmount !== (int)floor($merchantAmount)) {
+                throw new Exception("Invalid payment amount.");
+            }
+            $values['amount'] = (int)floor($merchantAmount);
+        } else {
+            if ($browserAmount === null || $browserAmount < 1) {
+                throw new Exception("Invalid payment amount.");
+            }
+            $values['amount'] = (int)$browserAmount;
+        }
+
+        $merchantCurrency = $this->formParameters['currency'] ?? null;
+        $browserCurrency  = isset($data['currency']) && is_string($data['currency']) ? strtoupper(trim($data['currency'])) : null;
+        if (!empty($merchantCurrency)) {
+            if ($browserCurrency !== null && $browserCurrency !== '' && $browserCurrency !== strtoupper($merchantCurrency)) {
+                throw new Exception("Invalid payment currency.");
+            }
+            $values['currency'] = strtoupper($merchantCurrency);
+        } else {
+            if (empty($browserCurrency)) {
+                throw new Exception("Invalid payment currency.");
+            }
+            $values['currency'] = $browserCurrency;
+        }
+
+        return $values;
+    }
+
     private function checkout($data) {
         try {
             $this->checkConfigParam();
+            $data = is_string($data) ? (json_decode($data, true) ?: []) : (is_array($data) ? $data : []);
+            $data = array_merge($data, $this->lockedPaymentValues($data));
+            $this->assertOrderNotAlreadyPaid();
             $token = $this->refreshTokenIfNeeded();
             if (!$token) {
                 return ['httpCode' => 401, 'response' => ['error' => 'Authentication failed']];
             }
             $timestamp = time();
             $random = substr(str_shuffle(str_repeat('0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ', 4)), 0, 4);
-            $data = is_string($data) ? json_decode($data, true) : $data;
-            // Validate notify_url if defined
             $notify_url = $this->formParameters['notify_url'] ?? self::$config['notify_url'] ?? '';
             if (!empty($notify_url)) {
                 if (!$this->isUrlStrictlyValid($notify_url)) {
                     throw new Exception("Invalid notification URL format.");
                 }
-                // Disallow usage of example.com as a placeholder
                 $parsedUrl = parse_url($notify_url);
                 if (isset($parsedUrl['host']) && strpos($parsedUrl['host'], 'example.com') !== false) {
                     throw new Exception("The notify_url cannot point to example.com. Please use a valid URL.");
@@ -318,9 +355,9 @@ class AfribapayClass {
                 "phone_number" => $data['phone'],
                 "amount"       => $data['amount'],
                 "currency"     => $data['currency'],
-                "order_id"     => $this->formParameters['order_id'] ?? 'modalID' . md5(implode('', [$data['country'], $data['currency'], $data['amount'], $data['phone'], $random , $timestamp])),
+                "order_id"     => $this->formParameters['order_id'] ?? 'webID' . implode('', [$data['country'], $data['currency'], $data['amount'], $data['phone'], $random , $timestamp]),
                 "merchant_key" => self::$config['merchantKey'],
-                "reference_id" => $this->formParameters['reference_id'] ?? $data['reference_id'] ?? 'Modal-' . implode('-', [$data['country'], $data['currency'], $data['operator']]),
+                "reference_id" => $this->formParameters['reference_id'] ?? $data['reference_id'] ?? 'webcheckout-ref-' . implode('-', [$data['country'], $data['currency'], $data['amount']]),
                 "lang"         => self::$config['lang'],
                 "notify_url"   => $notify_url
             ];
@@ -330,7 +367,7 @@ class AfribapayClass {
             }
 
             $ch = $this->createCurlHandle(
-                self::$config['baseUrl'] . '/v1/pay/payin',
+                $this->apiUrl('/v1/pay/payin'),
                 true,
                 [
                     'Authorization: Bearer ' . $token,
@@ -338,23 +375,40 @@ class AfribapayClass {
                 ]
             );
             curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($body));
-    
-            return $this->executeRequest($ch);
+
+            $result = $this->executeRequest($ch);
+            TransactionConfig::rememberPayment(
+                (string)($result['response']['data']['order_id'] ?? $body['order_id']),
+                isset($result['response']['data']['transaction_id']) ? (string)$result['response']['data']['transaction_id'] : null
+            );
+            return $result;
+        } catch (AfribaPayPublicException $e) {
+            throw $e;
         } catch (Exception $e) {
             throw new Exception($e->getMessage());
+        }
+    }
+
+    // A previous payment of this order may have succeeded (late operator confirmation, reload after a success)
+    private function assertOrderNotAlreadyPaid(): void {
+        foreach (TransactionConfig::paymentTransactionIds() as $paymentTransactionId) {
+            $result = $this->status($paymentTransactionId, 'transaction_id');
+            if (($result['response']['data']['status'] ?? null) === 'SUCCESS') {
+                throw new AfribaPayPublicException(modal_afp_lang('Ck.ORDER_ALREADY_PAID'));
+            }
         }
     }
 
     private function walletOtp($data) {
         try {
             $this->checkConfigParam();
-        
+            $data = is_string($data) ? (json_decode($data, true) ?: []) : (is_array($data) ? $data : []);
+            $data = array_merge($data, $this->lockedPaymentValues($data));
+
             $token = $this->refreshTokenIfNeeded();
             if (!$token) {
                 return ['httpCode' => 401, 'response' => ['error' => 'Authentication failed']];
             }
-            $data = is_string($data) ? json_decode($data, true) : $data;
-            $data['amount'] = floor($data['amount']);
             $body = [
                 "operator"     => $data['operator'],
                 "country"      => $data['country'],
@@ -364,7 +418,7 @@ class AfribapayClass {
                 "merchant_key" => self::$config['merchantKey']
             ];
             $ch = $this->createCurlHandle(
-                self::$config['baseUrl'] . '/v1/pay/otp',
+                $this->apiUrl('/v1/pay/otp'),
                 true,
                 [
                     'Authorization: Bearer ' . $token,
@@ -378,14 +432,15 @@ class AfribapayClass {
         }
     }
 
-    private function status($order_id) {
+    // By order_id the API returns the FIRST transaction of the order: follow a payment by its transaction_id
+    private function status(string $id, string $lookup = 'order_id') {
         try{
             $token = $this->refreshTokenIfNeeded();
             if (!$token) {
                 return ['httpCode' => 401, 'response' => ['error' => 'Authentication failed']];
             }
             $ch = $this->createCurlHandle(
-                self::$config['baseUrl'] . '/v1/status?order_id=' . urlencode($order_id),
+                $this->apiUrl('/v1/status?' . http_build_query([$lookup === 'transaction_id' ? 'transaction_id' : 'order_id' => $id])),
                 false,
                 [
                     'Authorization: Bearer ' . $token,
@@ -402,47 +457,4 @@ class AfribapayClass {
         error_log($message);
     }
 
-}
-
-try {
-    $rawData = file_get_contents('php://input');
-    $_POST = json_decode($rawData, true);
-    TransactionConfig::initialize();
-    $mbsError = false;
-    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-        if(isset($_POST['AfpModalPost'],$_POST['baseUrl'])){
-            try{
-                if($f=(new AfribapayClass())->sdkFirstAuthentication()) return; 
-                $mbsError = "Invalid authentication credentials.";
-            }catch(Exception $e){
-                throw new Exception($e->getMessage());
-            }
-        }else{
-            $rawData = file_get_contents('php://input');
-            $request = json_decode($rawData, true);
-            $_POST = $request;
-            if ($request === null) {
-                $mbsError = 'Invalid JSON received.';
-            }
-            if (isset($request['action'])) {;
-                switch ($request['action']) {
-                    case 'checkout':
-                        echo (new AfribapayClass())->getCheckout($request);
-                        break;
-                    case 'status':
-                        echo (new AfribapayClass())->getStatus($request['order_id'] ?? throw new InvalidArgumentException('order_id is required.'));
-                        break;
-                    case 'walletOtp':
-                        echo (new AfribapayClass())->sendWalletOtp($request);
-                        break;
-                    default:
-                        $mbsError = 'Invalid action.';
-                }
-            } else {
-                $mbsError = 'No action specified.'; 
-            }
-        }
-    }
-} catch(Exception $e){
-    $mbsError = $e->getMessage();
 }
